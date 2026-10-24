@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" fill="none">
+  <rect width="64" height="64" rx="16" fill="#050811"/>
+  <circle cx="32" cy="32" r="28" stroke="url(#paint0_linear)" stroke-width="2"/>
+  <path d="M32 14L46 48H39L36 41H28L25 48H18L32 14ZM30 26L29 35H35L34 26H30Z" fill="url(#paint1_linear)"/>
+  <circle cx="32" cy="20" r="3" fill="#00F0FF" filter="url(#glow)"/>
+  <defs>
+    <filter id="glow" x="25" y="13" width="14" height="14" filterUnits="userSpaceOnUse">
+      <feGaussianBlur stdDeviation="2"/>
+    </filter>
+    <linearGradient id="paint0_linear" x1="0" y1="0" x2="64" y2="64" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#38BDF8"/>
+      <stop offset="0.5" stop-color="#8B5CF6"/>
+      <stop offset="1" stop-color="#0284C7"/>
+    </linearGradient>
+    <linearGradient id="paint1_linear" x1="18" y1="14" x2="46" y2="48" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#FFFFFF"/>
+      <stop offset="0.6" stop-color="#38BDF8"/>
+      <stop offset="1" stop-color="#A855F7"/>
+    </linearGradient>
+  </defs>
+</svg>
