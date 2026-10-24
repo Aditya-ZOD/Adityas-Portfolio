@@ -8,3 +8,4 @@ watchfiles>=0.20
 python-dotenv>=0.13
 httptools>=0.8.0
 websockets>=13.0
+resend>=2.6.0

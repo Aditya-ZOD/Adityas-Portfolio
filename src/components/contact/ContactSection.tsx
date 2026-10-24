@@ -67,7 +67,11 @@ export const ContactSection: React.FC = () => {
 
       if (response.ok && data.success) {
         setSubmitStatus('success');
-        setServerMessage(data.message || 'Message recorded and verified.');
+        if (data.delivery_status === 'sent') {
+          setServerMessage(data.message || 'Your message has been sent directly to Aditya’s inbox.');
+        } else {
+          setServerMessage(data.message || 'Your message has been received and securely stored.');
+        }
         setFormData({ name: '', email: '', subject: '', message: '' });
         setErrors({});
 
@@ -82,13 +86,15 @@ export const ContactSection: React.FC = () => {
         }
       } else {
         setSubmitStatus('error');
-        setServerMessage(data.message || data.detail || 'Message could not be processed automatically.');
+        setServerMessage(data.message || data.detail || 'Message could not be transmitted automatically.');
         setMailtoFallback(data.mailto_fallback || fallbackUrl);
+        // Preserves entered formData so visitor does not lose their typed message
       }
     } catch {
       setSubmitStatus('error');
       setServerMessage('Unable to reach backend delivery service. Please use direct email to transmit your message.');
       setMailtoFallback(fallbackUrl);
+      // Preserves entered formData
     } finally {
       setLoading(false);
     }
@@ -267,6 +273,7 @@ export const ContactSection: React.FC = () => {
                   <input
                     id="contact-name"
                     type="text"
+                    disabled={loading}
                     placeholder="e.g. Jane Doe"
                     value={formData.name}
                     onChange={(e) => setFormData({ ...formData, name: e.target.value })}
@@ -274,7 +281,7 @@ export const ContactSection: React.FC = () => {
                       errors.name
                         ? 'border-red-500/80 focus:ring-1 focus:ring-red-500'
                         : 'border-cosmos-700 focus:border-electric-cyan focus:ring-1 focus:ring-electric-cyan'
-                    }`}
+                    } ${loading ? 'opacity-60 cursor-not-allowed' : ''}`}
                   />
                   {errors.name && <p className="text-xs text-red-400 mt-1">{errors.name}</p>}
                 </div>
@@ -287,6 +294,7 @@ export const ContactSection: React.FC = () => {
                   <input
                     id="contact-email"
                     type="email"
+                    disabled={loading}
                     placeholder="e.g. recruiter@company.com"
                     value={formData.email}
                     onChange={(e) => setFormData({ ...formData, email: e.target.value })}
@@ -294,7 +302,7 @@ export const ContactSection: React.FC = () => {
                       errors.email
                         ? 'border-red-500/80 focus:ring-1 focus:ring-red-500'
                         : 'border-cosmos-700 focus:border-electric-cyan focus:ring-1 focus:ring-electric-cyan'
-                    }`}
+                    } ${loading ? 'opacity-60 cursor-not-allowed' : ''}`}
                   />
                   {errors.email && <p className="text-xs text-red-400 mt-1">{errors.email}</p>}
                 </div>
@@ -308,6 +316,7 @@ export const ContactSection: React.FC = () => {
                 <input
                   id="contact-subject"
                   type="text"
+                  disabled={loading}
                   placeholder="e.g. AI/ML Summer Internship Opportunity"
                   value={formData.subject}
                   onChange={(e) => setFormData({ ...formData, subject: e.target.value })}
@@ -315,7 +324,7 @@ export const ContactSection: React.FC = () => {
                     errors.subject
                       ? 'border-red-500/80 focus:ring-1 focus:ring-red-500'
                       : 'border-cosmos-700 focus:border-electric-cyan focus:ring-1 focus:ring-electric-cyan'
-                  }`}
+                  } ${loading ? 'opacity-60 cursor-not-allowed' : ''}`}
                 />
                 {errors.subject && <p className="text-xs text-red-400 mt-1">{errors.subject}</p>}
               </div>
@@ -328,6 +337,7 @@ export const ContactSection: React.FC = () => {
                 <textarea
                   id="contact-message"
                   rows={4}
+                  disabled={loading}
                   placeholder="Describe the opportunity or project details..."
                   value={formData.message}
                   onChange={(e) => setFormData({ ...formData, message: e.target.value })}
@@ -335,7 +345,7 @@ export const ContactSection: React.FC = () => {
                     errors.message
                       ? 'border-red-500/80 focus:ring-1 focus:ring-red-500'
                       : 'border-cosmos-700 focus:border-electric-cyan focus:ring-1 focus:ring-electric-cyan'
-                  }`}
+                  } ${loading ? 'opacity-60 cursor-not-allowed' : ''}`}
                 />
                 {errors.message && <p className="text-xs text-red-400 mt-1">{errors.message}</p>}
               </div>

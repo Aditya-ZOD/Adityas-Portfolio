@@ -12,10 +12,13 @@ client = TestClient(app)
 
 @pytest.fixture(autouse=True)
 def reset_limiters():
-    """Reset rate limiters before and after each test to ensure test isolation."""
+    """Reset rate limiters and environment variables before and after each test to ensure test isolation."""
     chat_limiter.clear()
     contact_limiter.clear()
+    old_env = dict(os.environ)
     yield
+    os.environ.clear()
+    os.environ.update(old_env)
     chat_limiter.clear()
     contact_limiter.clear()
 
@@ -85,6 +88,7 @@ def test_get_contact_messages_authorized_admin():
 def test_contact_unconfigured_mode():
     """Verifies that unconfigured delivery returns HTTP 503 with honest status and valid mailto fallback."""
     os.environ["CONTACT_DELIVERY_MODE"] = "unconfigured"
+    os.environ["CONTACT_RECEIVER_EMAIL"] = "receiver@example.com"
     payload = {
         "name": "Alex Reviewer",
         "email": "alex@example.org",
@@ -98,12 +102,13 @@ def test_contact_unconfigured_mode():
     assert data["delivery_status"] == "unconfigured"
     assert "not configured" in data["message"]
     assert data["mailto_fallback"] is not None
-    assert data["mailto_fallback"].startswith("mailto:adityagupta1624111@gmail.com")
+    assert data["mailto_fallback"].startswith("mailto:receiver@example.com")
     assert "Collegiate%20Collaboration" in data["mailto_fallback"]
 
 def test_contact_smtp_failure():
     """Verifies that SMTP connection failure returns HTTP 503 with error status and mailto fallback."""
     os.environ["CONTACT_DELIVERY_MODE"] = "smtp"
+    os.environ["CONTACT_RECEIVER_EMAIL"] = "receiver@example.com"
     os.environ["SMTP_HOST"] = "127.0.0.1"
     os.environ["SMTP_PORT"] = "49999"  # Dummy non-existent port
     os.environ["SMTP_USER"] = "dummy@example.com"
@@ -121,7 +126,156 @@ def test_contact_smtp_failure():
     assert data["success"] is False
     assert data["delivery_status"] == "failed"
     assert data["mailto_fallback"] is not None
-    assert "adityagupta1624111@gmail.com" in data["mailto_fallback"]
+    assert "receiver@example.com" in data["mailto_fallback"]
+
+# ==============================================================================
+# Resend Transactional Email Delivery Tests (Mocked)
+# ==============================================================================
+
+def test_contact_resend_successful_delivery_mock():
+    """Verifies that valid messages trigger Resend dispatch, persist to SQLite, and return delivery status 'sent' with provider message_id."""
+    os.environ["RESEND_API_KEY"] = "re_mock_test_key_abc123"
+    os.environ["CONTACT_RECEIVER_EMAIL"] = "aditya-inbox@test.com"
+    os.environ["EMAIL_FROM"] = "Aditya Portfolio <onboarding@resend.dev>"
+    if "CONTACT_DELIVERY_MODE" in os.environ:
+        del os.environ["CONTACT_DELIVERY_MODE"]
+
+    mock_send_result = {"id": "re_msg_mock_777888"}
+
+    with patch("resend.Emails.send", return_value=mock_send_result) as mock_send:
+        payload = {
+            "name": "Maya Lin",
+            "email": "maya@venturetech.io",
+            "subject": "Machine Learning Collaboration",
+            "message": "We would love to interview you for our upcoming ML research project."
+        }
+        response = client.post("/api/contact", json=payload)
+        assert response.status_code == 200
+        data = response.json()
+        assert data["success"] is True
+        assert data["delivery_status"] == "sent"
+        assert data["message_id"] == "re_msg_mock_777888"
+        assert "Maya Lin" in data["message"]
+        assert data["mailto_fallback"] is None
+
+        # Verify mock send arguments
+        mock_send.assert_called_once()
+        params = mock_send.call_args[0][0]
+        assert params["from"] == "Aditya Portfolio <onboarding@resend.dev>"
+        assert params["to"] == ["aditya-inbox@test.com"]
+        assert params["reply_to"] == "maya@venturetech.io"
+        assert "[Portfolio] Machine Learning Collaboration (from Maya Lin)" in params["subject"]
+        assert "maya@venturetech.io" in params["text"]
+        assert "Maya Lin" in params["html"]
+
+        # Verify SQLite persistence
+        with sqlite3.connect(DB_PATH) as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT name, email, delivery_status FROM contact_messages WHERE email = ? ORDER BY id DESC LIMIT 1", ("maya@venturetech.io",))
+            row = cursor.fetchone()
+            assert row is not None
+            assert row[0] == "Maya Lin"
+            assert row[1] == "maya@venturetech.io"
+            assert row[2] == "sent"
+
+def test_contact_resend_html_escaping():
+    """Verifies that untrusted visitor input is escaped in HTML format to prevent injection."""
+    os.environ["RESEND_API_KEY"] = "re_mock_test_key_abc123"
+    os.environ["CONTACT_RECEIVER_EMAIL"] = "aditya-inbox@test.com"
+
+    mock_send_result = {"id": "re_msg_escape_123"}
+    with patch("resend.Emails.send", return_value=mock_send_result) as mock_send:
+        payload = {
+            "name": "Jane <script>alert('xss')</script>",
+            "email": "jane@safe.com",
+            "subject": "Inquiry & Opportunities",
+            "message": "Hello <img src=x onerror=alert(1)> and Tom & Jerry."
+        }
+        response = client.post("/api/contact", json=payload)
+        assert response.status_code == 200
+
+        params = mock_send.call_args[0][0]
+        html_content = params["html"]
+        # Ensure tags are escaped
+        assert "<script>" not in html_content
+        assert "&lt;script&gt;alert(&#x27;xss&#x27;)&lt;/script&gt;" in html_content
+        assert "<img src=x" not in html_content
+        assert "&lt;img src=x onerror=alert(1)&gt;" in html_content
+        assert "Tom &amp; Jerry" in html_content
+
+def test_contact_resend_provider_failure_handling():
+    """Verifies that a Resend provider failure/timeout returns HTTP 503, sets delivery_status='failed', and provides mailto fallback."""
+    os.environ["RESEND_API_KEY"] = "re_mock_test_key_abc123"
+    os.environ["CONTACT_RECEIVER_EMAIL"] = "aditya-inbox@test.com"
+
+    with patch("resend.Emails.send", side_effect=Exception("Resend API 500 internal gateway timeout")):
+        payload = {
+            "name": "David Miller",
+            "email": "david@agency.org",
+            "subject": "Website Redesign Inquiry",
+            "message": "Testing resilience against third-party provider downtime."
+        }
+        response = client.post("/api/contact", json=payload)
+        assert response.status_code == 503
+        data = response.json()
+        assert data["success"] is False
+        assert data["delivery_status"] == "failed"
+        assert data["mailto_fallback"] is not None
+        assert "aditya-inbox@test.com" in data["mailto_fallback"]
+
+        # Ensure database recorded the failure status
+        with sqlite3.connect(DB_PATH) as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT delivery_status FROM contact_messages WHERE email = ? ORDER BY id DESC LIMIT 1", ("david@agency.org",))
+            row = cursor.fetchone()
+            assert row is not None
+            assert row[0] == "email_failed"
+
+def test_contact_resend_missing_api_key_when_resend_mode():
+    """Verifies that selecting Resend mode without an API key safely returns HTTP 503 unconfigured status."""
+    os.environ["CONTACT_DELIVERY_MODE"] = "resend"
+    if "RESEND_API_KEY" in os.environ:
+        del os.environ["RESEND_API_KEY"]
+    os.environ["CONTACT_RECEIVER_EMAIL"] = "aditya-inbox@test.com"
+
+    payload = {
+        "name": "Grace Hopper",
+        "email": "grace@compilers.org",
+        "subject": "Advisory Board",
+        "message": "Testing contact endpoint behavior when RESEND_API_KEY is not defined."
+    }
+    response = client.post("/api/contact", json=payload)
+    assert response.status_code == 503
+    data = response.json()
+    assert data["success"] is False
+    assert data["delivery_status"] == "unconfigured"
+    assert "RESEND_API_KEY" in data["message"]
+    assert data["mailto_fallback"] is not None
+
+def test_contact_resend_missing_receiver_email():
+    """Verifies that missing receiver email triggers HTTP 503 unconfigured rather than failing silently."""
+    os.environ["RESEND_API_KEY"] = "re_mock_test_key_abc123"
+    if "CONTACT_RECEIVER_EMAIL" in os.environ:
+        del os.environ["CONTACT_RECEIVER_EMAIL"]
+    if "CONTACT_RECIPIENT_EMAIL" in os.environ:
+        del os.environ["CONTACT_RECIPIENT_EMAIL"]
+    if "PORTFOLIO_CONTACT_EMAIL" in os.environ:
+        del os.environ["PORTFOLIO_CONTACT_EMAIL"]
+
+    payload = {
+        "name": "Alan Turing",
+        "email": "alan@enigma.ac.uk",
+        "subject": "Computing Inquiries",
+        "message": "Testing behavior when contact receiver email is completely unset."
+    }
+    response = client.post("/api/contact", json=payload)
+    assert response.status_code == 503
+    data = response.json()
+    assert data["success"] is False
+    assert data["delivery_status"] == "unconfigured"
+    assert "recipient" in data["message"].lower()
+
+
 
 def test_contact_validation_errors():
     """Verifies rejection of invalid emails, missing required fields, and oversized/undersized text."""

@@ -40,3 +40,4 @@ class ContactResponse(BaseModel):
     message: str
     timestamp: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     mailto_fallback: Optional[str] = None
+    message_id: Optional[str] = None

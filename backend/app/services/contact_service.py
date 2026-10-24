@@ -2,6 +2,7 @@ import os
 import sqlite3
 import logging
 import hashlib
+import html
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Any, Optional
@@ -98,9 +99,31 @@ def hash_ip(ip_address: str) -> str:
     salt = os.getenv("IP_SALT", "aditya-cosmos-salt")
     return hashlib.sha256(f"{salt}:{ip_address}".encode()).hexdigest()[:16]
 
+def get_contact_receiver_email() -> str:
+    """
+    Resolves recipient email from environment variables without hardcoding personal email addresses.
+    Checks CONTACT_RECEIVER_EMAIL first, then CONTACT_RECIPIENT_EMAIL, then PORTFOLIO_CONTACT_EMAIL.
+    """
+    return (
+        os.getenv("CONTACT_RECEIVER_EMAIL", "").strip()
+        or os.getenv("CONTACT_RECIPIENT_EMAIL", "").strip()
+        or os.getenv("PORTFOLIO_CONTACT_EMAIL", "").strip()
+    )
+
+def get_email_from() -> str:
+    """
+    Resolves sender email address/domain permitted by provider.
+    Checks EMAIL_FROM, then CONTACT_FROM_EMAIL. Defaults to Resend's default verified sandbox domain.
+    """
+    return (
+        os.getenv("EMAIL_FROM", "").strip()
+        or os.getenv("CONTACT_FROM_EMAIL", "").strip()
+        or "Aditya Portfolio <onboarding@resend.dev>"
+    )
+
 def generate_mailto_url(subject: str, message: str, name: str) -> str:
     """Generates a pre-filled mailto URL as a reliable client fallback."""
-    recipient = "adityagupta1624111@gmail.com"
+    recipient = get_contact_receiver_email()
     encoded_sub = quote(f"[Portfolio Contact] {subject}")
     body_text = f"Hi Aditya,\n\n{message}\n\nFrom,\n{name}"
     encoded_body = quote(body_text)
@@ -109,20 +132,22 @@ def generate_mailto_url(subject: str, message: str, name: str) -> str:
 def deliver_contact_message(payload: ContactRequest, client_ip: str) -> Dict[str, Any]:
     """
     Delivers a contact message based on configured delivery mechanism.
-    Does NOT log email addresses or message bodies.
+    Supports Resend transactional email, SMTP, and local SQLite persistence.
+    Does NOT log credentials or private message bodies.
     Returns delivery confirmation dictionary.
     """
-    mode = os.getenv("CONTACT_DELIVERY_MODE", "database").lower().strip()
-    mailto_url = generate_mailto_url(payload.subject, payload.message, payload.name)
+    mode = os.getenv("CONTACT_DELIVERY_MODE", "").lower().strip()
+    resend_api_key = os.getenv("RESEND_API_KEY", "").strip()
     now_iso = datetime.now(timezone.utc).isoformat()
+    mailto_url = generate_mailto_url(payload.subject, payload.message, payload.name)
 
     # 1. Mode: Explicitly unconfigured
-    if mode == "unconfigured" or mode == "none":
+    if mode in ("unconfigured", "none"):
         logger.info(f"Contact attempt received while delivery mode is '{mode}' (msg length: {len(payload.message)})")
         return {
             "success": False,
             "delivery_status": "unconfigured",
-            "message": "Automated server-side message delivery is not configured on this instance. Please use the direct mailto link to send your message.",
+            "message": "Automated server-side message delivery is not configured on this instance. Please use the direct email link to send your message.",
             "timestamp": now_iso,
             "mailto_fallback": mailto_url
         }
@@ -133,9 +158,10 @@ def deliver_contact_message(payload: ContactRequest, client_ip: str) -> Dict[str
         smtp_user = os.getenv("SMTP_USER")
         smtp_pass = os.getenv("SMTP_PASSWORD")
         smtp_port = int(os.getenv("SMTP_PORT", "587"))
+        recipient = get_contact_receiver_email()
 
-        if not smtp_host or not smtp_user:
-            logger.warning("SMTP delivery requested but SMTP_HOST or SMTP_USER is missing.")
+        if not smtp_host or not smtp_user or not recipient:
+            logger.warning("SMTP delivery requested but SMTP configuration or recipient email is missing.")
             return {
                 "success": False,
                 "delivery_status": "unconfigured",
@@ -149,7 +175,6 @@ def deliver_contact_message(payload: ContactRequest, client_ip: str) -> Dict[str
             from email.mime.text import MIMEText
             from email.mime.multipart import MIMEMultipart
 
-            recipient = os.getenv("CONTACT_RECIPIENT_EMAIL", "adityagupta1624111@gmail.com")
             msg = MIMEMultipart()
             msg["From"] = os.getenv("SMTP_FROM", smtp_user)
             msg["To"] = recipient
@@ -183,7 +208,155 @@ def deliver_contact_message(payload: ContactRequest, client_ip: str) -> Dict[str
                 "mailto_fallback": mailto_url
             }
 
-    # 3. Default Mode: Secure SQLite Persistence
+    # 3. Transactional Delivery via Resend (Active when RESEND_API_KEY is present or CONTACT_DELIVERY_MODE=resend)
+    if resend_api_key or mode == "resend":
+        if not resend_api_key:
+            logger.warning("Resend delivery selected but RESEND_API_KEY is not configured.")
+            return {
+                "success": False,
+                "delivery_status": "unconfigured",
+                "message": "Email delivery service is missing server configuration (RESEND_API_KEY). Please reach Aditya directly via email.",
+                "timestamp": now_iso,
+                "mailto_fallback": mailto_url
+            }
+
+        recipient = get_contact_receiver_email()
+        if not recipient:
+            logger.warning("Resend delivery requested but CONTACT_RECEIVER_EMAIL is not configured.")
+            return {
+                "success": False,
+                "delivery_status": "unconfigured",
+                "message": "Email notification recipient is not configured. Please reach Aditya directly via email.",
+                "timestamp": now_iso,
+                "mailto_fallback": mailto_url
+            }
+
+        # Step 3a: Preserve message to SQLite database first
+        msg_id = None
+        try:
+            init_contact_db()
+            ip_masked = hash_ip(client_ip)
+            with sqlite3.connect(DB_PATH) as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    """
+                    INSERT INTO contact_messages (name, email, subject, message, delivery_status, created_at, ip_hash)
+                    VALUES (?, ?, ?, ?, ?, ?, ?);
+                    """,
+                    (payload.name, payload.email, payload.subject, payload.message, "persisted", now_iso, ip_masked)
+                )
+                conn.commit()
+                msg_id = cursor.lastrowid
+            sync_inbox_markdown()
+        except Exception as db_err:
+            logger.error(f"Database pre-persistence encountered error: {type(db_err).__name__}")
+
+        # Step 3b: Send notification via Resend
+        try:
+            import resend
+            resend.api_key = resend_api_key
+
+            safe_name = html.escape(payload.name)
+            safe_email = html.escape(payload.email)
+            safe_subject = html.escape(payload.subject)
+            safe_message = html.escape(payload.message).replace("\n", "<br/>")
+
+            html_content = f"""<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>New Portfolio Contact Inquiry</title>
+</head>
+<body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background-color: #0b1120; color: #f8fafc; padding: 24px; margin: 0;">
+  <div style="max-width: 600px; margin: 0 auto; background-color: #0f172a; border: 1px solid #1e293b; border-radius: 16px; padding: 32px;">
+    <div style="border-bottom: 1px solid #1e293b; padding-bottom: 16px; margin-bottom: 24px;">
+      <span style="font-family: monospace; font-size: 11px; text-transform: uppercase; color: #06b6d4; letter-spacing: 1px;">05 // INCOMING TRANSMISSION</span>
+      <h1 style="color: #ffffff; font-size: 22px; font-weight: 700; margin: 8px 0 0 0;">New Portfolio Message</h1>
+    </div>
+    <div style="margin-bottom: 20px;">
+      <p style="margin: 6px 0; font-size: 14px; color: #94a3b8;"><strong style="color: #cbd5e1;">From:</strong> {safe_name} &lt;<a href="mailto:{safe_email}" style="color: #38bdf8; text-decoration: none;">{safe_email}</a>&gt;</p>
+      <p style="margin: 6px 0; font-size: 14px; color: #94a3b8;"><strong style="color: #cbd5e1;">Subject:</strong> {safe_subject}</p>
+      <p style="margin: 6px 0; font-size: 14px; color: #94a3b8;"><strong style="color: #cbd5e1;">Received:</strong> {now_iso}</p>
+    </div>
+    <div style="background-color: #1e293b; border-left: 4px solid #06b6d4; padding: 18px; border-radius: 8px; margin: 24px 0;">
+      <p style="margin: 0; font-size: 14px; line-height: 1.6; color: #f1f5f9; white-space: pre-wrap;">{safe_message}</p>
+    </div>
+    <div style="border-top: 1px solid #1e293b; padding-top: 18px; margin-top: 24px; font-size: 12px; color: #64748b;">
+      <p style="margin: 0;">You can reply directly to this email to respond to <strong style="color: #94a3b8;">{safe_name}</strong> at <a href="mailto:{safe_email}" style="color: #38bdf8; text-decoration: none;">{safe_email}</a>.</p>
+    </div>
+  </div>
+</body>
+</html>"""
+
+            text_content = f"""New Portfolio Contact Inquiry
+From: {payload.name} ({payload.email})
+Subject: {payload.subject}
+Time: {now_iso}
+
+Message:
+{payload.message}
+
+---
+Reply directly to this email to respond to {payload.email}.
+"""
+
+            params = {
+                "from": get_email_from(),
+                "to": [recipient],
+                "reply_to": payload.email,
+                "subject": f"[Portfolio] {payload.subject} (from {payload.name})",
+                "html": html_content,
+                "text": text_content,
+            }
+
+            email_response = resend.Emails.send(params)
+
+            message_id = None
+            if isinstance(email_response, dict):
+                message_id = email_response.get("id")
+            elif hasattr(email_response, "id"):
+                message_id = getattr(email_response, "id")
+            elif hasattr(email_response, "get"):
+                message_id = email_response.get("id")
+
+            # Update SQLite delivery status to sent
+            if msg_id:
+                try:
+                    with sqlite3.connect(DB_PATH) as conn:
+                        conn.execute("UPDATE contact_messages SET delivery_status = 'sent' WHERE id = ?", (msg_id,))
+                        conn.commit()
+                    sync_inbox_markdown()
+                except Exception:
+                    pass
+
+            logger.info(f"Contact notification sent via Resend (msg_id: #{msg_id}, provider_id: {message_id})")
+            return {
+                "success": True,
+                "delivery_status": "sent",
+                "message": f"Thank you, {payload.name}. Your message has been sent directly to Aditya's inbox.",
+                "timestamp": now_iso,
+                "mailto_fallback": None,
+                "message_id": message_id or (str(msg_id) if msg_id else "delivered")
+            }
+        except Exception as e:
+            logger.error(f"Resend delivery failed: {type(e).__name__} - {str(e)[:100]}")
+            if msg_id:
+                try:
+                    with sqlite3.connect(DB_PATH) as conn:
+                        conn.execute("UPDATE contact_messages SET delivery_status = 'email_failed' WHERE id = ?", (msg_id,))
+                        conn.commit()
+                    sync_inbox_markdown()
+                except Exception:
+                    pass
+            return {
+                "success": False,
+                "delivery_status": "failed",
+                "message": "Message saved locally, but email delivery encountered an error. Please click below to send via your email client.",
+                "timestamp": now_iso,
+                "mailto_fallback": mailto_url
+            }
+
+    # 4. Fallback Mode: Secure SQLite Persistence (when no email provider credentials are provided)
     try:
         init_contact_db()
         ip_masked = hash_ip(client_ip)
@@ -203,14 +376,13 @@ def deliver_contact_message(payload: ContactRequest, client_ip: str) -> Dict[str
         if not msg_id:
             raise RuntimeError("Database insertion failed to produce a valid row ID.")
 
-        # Log safely without PII
         logger.info(f"Contact message accepted and safely stored with ID #{msg_id} (length: {len(payload.message)} chars)")
         sync_inbox_markdown()
 
         return {
             "success": True,
             "delivery_status": "persisted",
-            "message": f"Thank you, {payload.name}. Your message has been received and securely stored for Aditya. He will respond soon.",
+            "message": f"Thank you, {payload.name}. Your message has been received and securely stored for Aditya. (Email notifications are offline on this server).",
             "timestamp": now_iso,
             "mailto_fallback": None
         }
@@ -223,3 +395,4 @@ def deliver_contact_message(payload: ContactRequest, client_ip: str) -> Dict[str
             "timestamp": now_iso,
             "mailto_fallback": mailto_url
         }
+

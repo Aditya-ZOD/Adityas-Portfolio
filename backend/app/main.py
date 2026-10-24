@@ -78,7 +78,11 @@ app.include_router(contact_router)
 @app.get("/api/health", tags=["Health"])
 def health_check():
     provider = os.getenv("LLM_PROVIDER", "local_fallback").lower().strip()
-    contact_mode = os.getenv("CONTACT_DELIVERY_MODE", "database").lower().strip()
+    resend_key = os.getenv("RESEND_API_KEY", "").strip()
+    if resend_key:
+        contact_mode = "resend"
+    else:
+        contact_mode = os.getenv("CONTACT_DELIVERY_MODE", "database").lower().strip()
     
     if provider == "openai":
         provider_ready = bool(os.getenv("OPENAI_API_KEY"))
@@ -89,12 +93,15 @@ def health_check():
     else:
         provider_ready = True  # local_fallback is always ready
 
+    email_ready = bool(resend_key or (contact_mode == "smtp" and os.getenv("SMTP_HOST") and os.getenv("SMTP_USER")))
+
     return {
         "status": "healthy",
         "service": "Aditya Gupta Portfolio Backend",
         "llm_provider": provider,
         "llm_provider_ready": provider_ready,
         "contact_delivery_mode": contact_mode,
+        "email_provider_ready": email_ready,
         "engine": provider if provider_ready else "portfolio-grounded-fallback",
         "cors_origins_count": len(origins)
     }
