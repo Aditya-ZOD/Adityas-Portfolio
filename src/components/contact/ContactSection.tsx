@@ -28,25 +28,56 @@ export const ContactSection: React.FC = () => {
 
   const validate = () => {
     const newErrors: Record<string, string> = {};
-    if (!formData.name.trim() || formData.name.trim().length < 2) {
+    const trimmedName = formData.name.trim();
+    const trimmedEmail = formData.email.trim();
+    const trimmedSubject = formData.subject.trim();
+    const trimmedMessage = formData.message.trim();
+
+    if (!trimmedName) {
+      newErrors.name = 'Please provide your name.';
+    } else if (trimmedName.length < 2) {
       newErrors.name = 'Please provide your name (at least 2 characters).';
     }
+
     const emailRegex = /^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$/;
-    if (!formData.email.trim() || !emailRegex.test(formData.email.trim())) {
+    if (!trimmedEmail) {
+      newErrors.email = 'Please provide your email address.';
+    } else if (!emailRegex.test(trimmedEmail) || trimmedEmail.includes('..')) {
       newErrors.email = 'Please provide a valid email address (e.g. name@company.com).';
+    } else {
+      const parts = trimmedEmail.split('@');
+      if (parts.length !== 2 || !parts[1].includes('.') || parts[1].startsWith('.') || parts[1].endsWith('.')) {
+        newErrors.email = 'Please provide a valid email domain (e.g. name@company.com).';
+      }
     }
-    if (!formData.subject.trim() || formData.subject.trim().length < 3) {
+
+
+    if (!trimmedSubject) {
+      newErrors.subject = 'Please provide a subject.';
+    } else if (trimmedSubject.length < 3) {
       newErrors.subject = 'Subject should be at least 3 characters.';
     }
-    if (!formData.message.trim() || formData.message.trim().length < 10) {
+
+    if (!trimmedMessage) {
+      newErrors.message = 'Please provide a message.';
+    } else if (trimmedMessage.length < 10) {
       newErrors.message = 'Message must be at least 10 characters.';
     }
+
     setErrors(newErrors);
     return Object.keys(newErrors).length === 0;
   };
 
-  const handleSubmit = async (e: React.FormEvent) => {
+  const handleSubmit = async (e: React.FormEvent<HTMLFormElement>) => {
     e.preventDefault();
+
+    if (e.currentTarget && typeof e.currentTarget.reportValidity === 'function') {
+      if (!e.currentTarget.reportValidity()) {
+        validate();
+        return;
+      }
+    }
+
     if (!validate()) return;
 
     setLoading(true);
@@ -54,24 +85,32 @@ export const ContactSection: React.FC = () => {
     setServerMessage('');
     setMailtoFallback(null);
 
-    const fallbackUrl = generateLocalMailto(formData.subject, formData.message, formData.name);
+    const trimmedPayload = {
+      name: formData.name.trim(),
+      email: formData.email.trim().toLowerCase(),
+      subject: formData.subject.trim(),
+      message: formData.message.trim()
+    };
+
+    const fallbackUrl = generateLocalMailto(trimmedPayload.subject, trimmedPayload.message, trimmedPayload.name);
 
     try {
       const response = await fetch(buildApiUrl('/api/contact'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(formData)
+        body: JSON.stringify(trimmedPayload)
       });
 
-      const data = await response.json();
+      let data: any = null;
+      try {
+        data = await response.json();
+      } catch {
+        data = null;
+      }
 
-      if (response.ok && data.success) {
+      if (response.ok && data && data.success && data.delivery_status === 'sent') {
         setSubmitStatus('success');
-        if (data.delivery_status === 'sent') {
-          setServerMessage(data.message || 'Your message has been sent directly to Aditya’s inbox.');
-        } else {
-          setServerMessage(data.message || 'Your message has been received and securely stored.');
-        }
+        setServerMessage(data.message || 'Your message has been sent directly to Aditya’s inbox.');
         setFormData({ name: '', email: '', subject: '', message: '' });
         setErrors({});
 
@@ -86,19 +125,20 @@ export const ContactSection: React.FC = () => {
         }
       } else {
         setSubmitStatus('error');
-        setServerMessage(data.message || data.detail || 'Message could not be transmitted automatically.');
-        setMailtoFallback(data.mailto_fallback || fallbackUrl);
+        setServerMessage("Your message could not be sent. Please try again later or contact me directly.");
+        setMailtoFallback((data && data.mailto_fallback) || fallbackUrl);
         // Preserves entered formData so visitor does not lose their typed message
       }
     } catch {
       setSubmitStatus('error');
-      setServerMessage('Unable to reach backend delivery service. Please use direct email to transmit your message.');
+      setServerMessage("Your message could not be sent. Please try again later or contact me directly.");
       setMailtoFallback(fallbackUrl);
       // Preserves entered formData
     } finally {
       setLoading(false);
     }
   };
+
 
   const handleCopyEmail = () => {
     navigator.clipboard.writeText(profileData.email);
@@ -273,6 +313,7 @@ export const ContactSection: React.FC = () => {
                   <input
                     id="contact-name"
                     type="text"
+                    required
                     disabled={loading}
                     placeholder="e.g. Jane Doe"
                     value={formData.name}
@@ -294,6 +335,7 @@ export const ContactSection: React.FC = () => {
                   <input
                     id="contact-email"
                     type="email"
+                    required
                     disabled={loading}
                     placeholder="e.g. recruiter@company.com"
                     value={formData.email}
@@ -316,6 +358,7 @@ export const ContactSection: React.FC = () => {
                 <input
                   id="contact-subject"
                   type="text"
+                  required
                   disabled={loading}
                   placeholder="e.g. AI/ML Summer Internship Opportunity"
                   value={formData.subject}
@@ -337,6 +380,7 @@ export const ContactSection: React.FC = () => {
                 <textarea
                   id="contact-message"
                   rows={4}
+                  required
                   disabled={loading}
                   placeholder="Describe the opportunity or project details..."
                   value={formData.message}
@@ -347,6 +391,7 @@ export const ContactSection: React.FC = () => {
                       : 'border-cosmos-700 focus:border-electric-cyan focus:ring-1 focus:ring-electric-cyan'
                   } ${loading ? 'opacity-60 cursor-not-allowed' : ''}`}
                 />
+
                 {errors.message && <p className="text-xs text-red-400 mt-1">{errors.message}</p>}
               </div>
 

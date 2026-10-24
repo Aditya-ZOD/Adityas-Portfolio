@@ -147,7 +147,7 @@ def deliver_contact_message(payload: ContactRequest, client_ip: str) -> Dict[str
         return {
             "success": False,
             "delivery_status": "unconfigured",
-            "message": "Automated server-side message delivery is not configured on this instance. Please use the direct email link to send your message.",
+            "message": "Your message could not be sent. Please try again later or contact me directly.",
             "timestamp": now_iso,
             "mailto_fallback": mailto_url
         }
@@ -165,7 +165,7 @@ def deliver_contact_message(payload: ContactRequest, client_ip: str) -> Dict[str
             return {
                 "success": False,
                 "delivery_status": "unconfigured",
-                "message": "Email delivery service is missing server configuration. Please reach Aditya directly via email.",
+                "message": "Your message could not be sent. Please try again later or contact me directly.",
                 "timestamp": now_iso,
                 "mailto_fallback": mailto_url
             }
@@ -203,7 +203,7 @@ def deliver_contact_message(payload: ContactRequest, client_ip: str) -> Dict[str
             return {
                 "success": False,
                 "delivery_status": "failed",
-                "message": "The email delivery server encountered an error transmitting your message. Please click below to send via your email client.",
+                "message": "Your message could not be sent. Please try again later or contact me directly.",
                 "timestamp": now_iso,
                 "mailto_fallback": mailto_url
             }
@@ -215,7 +215,7 @@ def deliver_contact_message(payload: ContactRequest, client_ip: str) -> Dict[str
             return {
                 "success": False,
                 "delivery_status": "unconfigured",
-                "message": "Email delivery service is missing server configuration (RESEND_API_KEY). Please reach Aditya directly via email.",
+                "message": "Your message could not be sent. Please try again later or contact me directly.",
                 "timestamp": now_iso,
                 "mailto_fallback": mailto_url
             }
@@ -226,7 +226,7 @@ def deliver_contact_message(payload: ContactRequest, client_ip: str) -> Dict[str
             return {
                 "success": False,
                 "delivery_status": "unconfigured",
-                "message": "Email notification recipient is not configured. Please reach Aditya directly via email.",
+                "message": "Your message could not be sent. Please try again later or contact me directly.",
                 "timestamp": now_iso,
                 "mailto_fallback": mailto_url
             }
@@ -313,11 +313,18 @@ Reply directly to this email to respond to {payload.email}.
 
             message_id = None
             if isinstance(email_response, dict):
+                if email_response.get("error") or email_response.get("statusCode", 200) >= 400:
+                    raise RuntimeError(f"Resend rejected message: {email_response}")
                 message_id = email_response.get("id")
             elif hasattr(email_response, "id"):
                 message_id = getattr(email_response, "id")
             elif hasattr(email_response, "get"):
+                if email_response.get("error"):
+                    raise RuntimeError(f"Resend rejected message: {email_response.get('error')}")
                 message_id = email_response.get("id")
+
+            if not message_id:
+                raise RuntimeError("Resend provider response did not contain an acceptance message ID.")
 
             # Update SQLite delivery status to sent
             if msg_id:
@@ -351,12 +358,13 @@ Reply directly to this email to respond to {payload.email}.
             return {
                 "success": False,
                 "delivery_status": "failed",
-                "message": "Message saved locally, but email delivery encountered an error. Please click below to send via your email client.",
+                "message": "Your message could not be sent. Please try again later or contact me directly.",
                 "timestamp": now_iso,
                 "mailto_fallback": mailto_url
             }
 
     # 4. Fallback Mode: Secure SQLite Persistence (when no email provider credentials are provided)
+    # Stored locally for administrative ledger inspection, but reported as unconfigured notification delivery
     try:
         init_contact_db()
         ip_masked = hash_ip(client_ip)
@@ -368,7 +376,7 @@ Reply directly to this email to respond to {payload.email}.
                 INSERT INTO contact_messages (name, email, subject, message, delivery_status, created_at, ip_hash)
                 VALUES (?, ?, ?, ?, ?, ?, ?);
                 """,
-                (payload.name, payload.email, payload.subject, payload.message, "persisted", now_iso, ip_masked)
+                (payload.name, payload.email, payload.subject, payload.message, "persisted_without_notification", now_iso, ip_masked)
             )
             conn.commit()
             msg_id = cursor.lastrowid
@@ -376,23 +384,24 @@ Reply directly to this email to respond to {payload.email}.
         if not msg_id:
             raise RuntimeError("Database insertion failed to produce a valid row ID.")
 
-        logger.info(f"Contact message accepted and safely stored with ID #{msg_id} (length: {len(payload.message)} chars)")
+        logger.info(f"Contact message safely stored in SQLite ledger with ID #{msg_id}, but email provider is offline.")
         sync_inbox_markdown()
 
         return {
-            "success": True,
-            "delivery_status": "persisted",
-            "message": f"Thank you, {payload.name}. Your message has been received and securely stored for Aditya. (Email notifications are offline on this server).",
+            "success": False,
+            "delivery_status": "unconfigured",
+            "message": "Your message could not be sent. Please try again later or contact me directly.",
             "timestamp": now_iso,
-            "mailto_fallback": None
+            "mailto_fallback": mailto_url
         }
     except Exception as e:
         logger.error(f"Database persistence failed: {type(e).__name__}")
         return {
             "success": False,
             "delivery_status": "failed",
-            "message": "Storage error while recording your message. Please reach Aditya directly via email.",
+            "message": "Your message could not be sent. Please try again later or contact me directly.",
             "timestamp": now_iso,
             "mailto_fallback": mailto_url
         }
+
 

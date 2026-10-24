@@ -7,9 +7,11 @@
     "dev": "vite",
     "build": "tsc -b && vite build",
     "lint": "oxlint",
+    "test:frontend": "node --test tests/test_contact_form_flow.js",
     "preview": "vite preview",
     "inbox": ".\\.venv\\Scripts\\python backend/view_inbox.py"
   },
+
   "dependencies": {
     "@types/canvas-confetti": "^1.9.0",
     "@types/three": "^0.170.0",

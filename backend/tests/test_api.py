@@ -26,9 +26,11 @@ def reset_limiters():
 # Priority 1 Tests: Contact Delivery Mechanism & SQLite Persistence
 # ==============================================================================
 
-def test_contact_submission_sqlite_persistence():
-    """Verifies that a valid message is stored in SQLite and returns HTTP 200 with delivery_status='persisted'."""
+def test_contact_submission_sqlite_persistence_when_email_unconfigured():
+    """Verifies that a message is safely persisted to SQLite when email provider is unconfigured, returning HTTP 503 without false success."""
     os.environ["CONTACT_DELIVERY_MODE"] = "database"
+    if "RESEND_API_KEY" in os.environ:
+        del os.environ["RESEND_API_KEY"]
     payload = {
         "name": "Jane Recruiter",
         "email": "jane@techcorp.com",
@@ -36,12 +38,12 @@ def test_contact_submission_sqlite_persistence():
         "message": "Hi Aditya, we reviewed your NutriAI and OmniPredict projects and would like to discuss an opportunity."
     }
     response = client.post("/api/contact", json=payload)
-    assert response.status_code == 200
+    assert response.status_code == 503
     data = response.json()
-    assert data["success"] is True
-    assert data["delivery_status"] == "persisted"
-    assert "Jane Recruiter" in data["message"]
-    assert data["mailto_fallback"] is None
+    assert data["success"] is False
+    assert data["delivery_status"] == "unconfigured"
+    assert "Your message could not be sent. Please try again later or contact me directly." in data["message"]
+    assert data["mailto_fallback"] is not None
 
     # Verify that the message actually exists in the SQLite database
     assert DB_PATH.exists(), "messages.db should exist"
@@ -53,7 +55,8 @@ def test_contact_submission_sqlite_persistence():
         assert row[0] == "Jane Recruiter"
         assert row[1] == "jane@techcorp.com"
         assert row[2] == "AI/ML Internship Discussion"
-        assert row[3] == "persisted"
+        assert row[3] == "persisted_without_notification"
+
 
 def test_get_contact_messages_anonymous_rejected():
     """CRITICAL SECURITY: Verifies that anonymous access to GET /api/contact/messages is strictly rejected with HTTP 401."""
@@ -100,8 +103,9 @@ def test_contact_unconfigured_mode():
     data = response.json()
     assert data["success"] is False
     assert data["delivery_status"] == "unconfigured"
-    assert "not configured" in data["message"]
+    assert "Your message could not be sent. Please try again later or contact me directly." in data["message"]
     assert data["mailto_fallback"] is not None
+
     assert data["mailto_fallback"].startswith("mailto:receiver@example.com")
     assert "Collegiate%20Collaboration" in data["mailto_fallback"]
 
@@ -249,7 +253,7 @@ def test_contact_resend_missing_api_key_when_resend_mode():
     data = response.json()
     assert data["success"] is False
     assert data["delivery_status"] == "unconfigured"
-    assert "RESEND_API_KEY" in data["message"]
+    assert "Your message could not be sent. Please try again later or contact me directly." in data["message"]
     assert data["mailto_fallback"] is not None
 
 def test_contact_resend_missing_receiver_email():
@@ -273,37 +277,149 @@ def test_contact_resend_missing_receiver_email():
     data = response.json()
     assert data["success"] is False
     assert data["delivery_status"] == "unconfigured"
-    assert "recipient" in data["message"].lower()
+    assert "Your message could not be sent. Please try again later or contact me directly." in data["message"]
 
 
 
-def test_contact_validation_errors():
-    """Verifies rejection of invalid emails, missing required fields, and oversized/undersized text."""
-    # Invalid email
-    res1 = client.post("/api/contact", json={
-        "name": "John",
-        "email": "not-a-valid-email",
-        "subject": "Hello",
-        "message": "Valid length message text for testing."
-    })
-    assert res1.status_code == 422
 
-    # Message too short (< 10 chars)
-    res2 = client.post("/api/contact", json={
-        "name": "John",
-        "email": "john@valid.com",
-        "subject": "Hello",
-        "message": "Short"
-    })
-    assert res2.status_code == 422
+def test_contact_resend_provider_auth_error_handling():
+    """Verifies that provider authentication/authorization errors return HTTP 503 with error status and safe user message."""
+    os.environ["RESEND_API_KEY"] = "re_invalid_api_key"
+    os.environ["CONTACT_RECEIVER_EMAIL"] = "aditya-inbox@test.com"
 
-    # Missing name
-    res3 = client.post("/api/contact", json={
-        "email": "john@valid.com",
-        "subject": "Hello",
-        "message": "This is a valid length message text."
-    })
-    assert res3.status_code == 422
+    with patch("resend.Emails.send", side_effect=Exception("Resend API 401 Unauthorized: API key invalid")):
+        payload = {
+            "name": "Auth Tester",
+            "email": "tester@auth.com",
+            "subject": "Authentication Failure Test",
+            "message": "Testing resilience against provider 401/403 authentication failures."
+        }
+        response = client.post("/api/contact", json=payload)
+        assert response.status_code == 503
+        data = response.json()
+        assert data["success"] is False
+        assert data["delivery_status"] == "failed"
+        assert data["message"] == "Your message could not be sent. Please try again later or contact me directly."
+        assert data["mailto_fallback"] is not None
+
+def test_contact_resend_provider_timeout_handling():
+    """Verifies that provider timeout exceptions return HTTP 503 with safe error message and mailto fallback."""
+    os.environ["RESEND_API_KEY"] = "re_mock_test_key_abc123"
+    os.environ["CONTACT_RECEIVER_EMAIL"] = "aditya-inbox@test.com"
+
+    with patch("resend.Emails.send", side_effect=httpx.TimeoutException("Resend connection timed out")):
+        payload = {
+            "name": "Timeout Tester",
+            "email": "tester@timeout.com",
+            "subject": "Network Timeout Test",
+            "message": "Testing resilience against third-party provider network timeouts."
+        }
+        response = client.post("/api/contact", json=payload)
+        assert response.status_code == 503
+        data = response.json()
+        assert data["success"] is False
+        assert data["delivery_status"] == "failed"
+        assert data["message"] == "Your message could not be sent. Please try again later or contact me directly."
+        assert data["mailto_fallback"] is not None
+
+def test_contact_resend_rejected_response_dict():
+    """Verifies that an error payload returned by provider without throwing returns HTTP 503 rather than false success."""
+    os.environ["RESEND_API_KEY"] = "re_mock_test_key_abc123"
+    os.environ["CONTACT_RECEIVER_EMAIL"] = "aditya-inbox@test.com"
+
+    # Provider returns an error dictionary instead of an accepted message ID
+    with patch("resend.Emails.send", return_value={"error": {"message": "Domain is not verified", "statusCode": 403}}):
+        payload = {
+            "name": "Rejection Tester",
+            "email": "tester@domain.com",
+            "subject": "Rejected Response Test",
+            "message": "Testing resilience against provider error payloads."
+        }
+        response = client.post("/api/contact", json=payload)
+        assert response.status_code == 503
+        data = response.json()
+        assert data["success"] is False
+        assert data["delivery_status"] == "failed"
+        assert data["message"] == "Your message could not be sent. Please try again later or contact me directly."
+
+def test_contact_missing_server_email_configuration():
+    """Verifies that requests to an instance without email provider credentials return HTTP 503 without reporting false success."""
+    if "RESEND_API_KEY" in os.environ:
+        del os.environ["RESEND_API_KEY"]
+    if "SMTP_HOST" in os.environ:
+        del os.environ["SMTP_HOST"]
+    os.environ["CONTACT_DELIVERY_MODE"] = "database"
+
+    payload = {
+        "name": "Config Tester",
+        "email": "tester@config.com",
+        "subject": "Missing Config Test",
+        "message": "Testing safe failure when server has no email provider configured."
+    }
+    response = client.post("/api/contact", json=payload)
+    assert response.status_code == 503
+    data = response.json()
+    assert data["success"] is False
+    assert data["delivery_status"] == "unconfigured"
+    assert data["message"] == "Your message could not be sent. Please try again later or contact me directly."
+    assert data["mailto_fallback"] is not None
+
+def test_contact_validation_empty_and_whitespace_fields_rejected():
+    """Verifies that empty and whitespace-only required fields are strictly rejected with HTTP 422."""
+    valid_base = {
+        "name": "Jane Recruiter",
+        "email": "jane@company.com",
+        "subject": "Collaboration",
+        "message": "Valid test message body of sufficient length."
+    }
+
+    # Empty and whitespace names
+    for bad_name in ["", " ", "   "]:
+        p = {**valid_base, "name": bad_name}
+        res = client.post("/api/contact", json=p)
+        assert res.status_code == 422, f"Failed to reject name: repr({bad_name})"
+
+    # Empty and whitespace emails
+    for bad_email in ["", " ", "   "]:
+        p = {**valid_base, "email": bad_email}
+        res = client.post("/api/contact", json=p)
+        assert res.status_code == 422, f"Failed to reject email: repr({bad_email})"
+
+    # Empty and whitespace subjects
+    for bad_subject in ["", " ", "   ", "  \t  "]:
+        p = {**valid_base, "subject": bad_subject}
+        res = client.post("/api/contact", json=p)
+        assert res.status_code == 422, f"Failed to reject subject: repr({bad_subject})"
+
+    # Empty and whitespace messages
+    for bad_msg in ["", " ", "          ", "\t\n  \t  "]:
+        p = {**valid_base, "message": bad_msg}
+        res = client.post("/api/contact", json=p)
+        assert res.status_code == 422, f"Failed to reject message: repr({bad_msg})"
+
+def test_contact_validation_invalid_emails_rejected():
+    """Verifies rejection of various malformed and invalid email addresses with HTTP 422."""
+    valid_base = {
+        "name": "Jane Recruiter",
+        "subject": "Collaboration",
+        "message": "Valid test message body of sufficient length."
+    }
+
+    invalid_emails = [
+        "not-an-email",
+        "user@",
+        "@domain.com",
+        "user@.com",
+        "user@domain..com",
+        "user@domain.",
+        "user@domain,com",
+        "user name@domain.com",
+        "user@domain com"
+    ]
+
+    for bad_email in invalid_emails:
+        res = client.post("/api/contact", json={**valid_base, "email": bad_email})
+        assert res.status_code == 422, f"Failed to reject invalid email: {bad_email}"
 
 def test_contact_header_injection_rejection():
     """Verifies that attempts to inject CRLF headers in name or subject are rejected with HTTP 422."""
@@ -327,22 +443,25 @@ def test_contact_header_injection_rejection():
 
 def test_contact_rate_limiting():
     """Verifies that exceeding the 5-message threshold triggers HTTP 429."""
-    os.environ["CONTACT_DELIVERY_MODE"] = "database"
+    os.environ["RESEND_API_KEY"] = "re_mock_test_key_abc123"
+    os.environ["CONTACT_RECEIVER_EMAIL"] = "aditya-inbox@test.com"
     payload = {
         "name": "Spam Tester",
         "email": "spam@test.com",
         "subject": "Repeated Ping",
         "message": "Testing the contact rate limiter sliding-window threshold."
     }
-    # 5 allowed submissions
-    for _ in range(5):
-        res = client.post("/api/contact", json=payload)
-        assert res.status_code == 200
+    with patch("resend.Emails.send", return_value={"id": "re_spam_mock_id"}):
+        # 5 allowed submissions
+        for _ in range(5):
+            res = client.post("/api/contact", json=payload)
+            assert res.status_code == 200
 
-    # 6th should be rejected by rate limiter
-    res_rejected = client.post("/api/contact", json=payload)
-    assert res_rejected.status_code == 429
-    assert "Too many messages sent" in res_rejected.json()["detail"]
+        # 6th should be rejected by rate limiter with 429
+        res_rejected = client.post("/api/contact", json=payload)
+        assert res_rejected.status_code == 429
+        assert "Too many messages sent" in res_rejected.json()["detail"]
+
 
 # ==============================================================================
 # Priority 2 Tests: AI Provider Handling & Honest Fallbacks
